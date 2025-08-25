@@ -1,0 +1,444 @@
+// Create these files in a NEW GitHub repository for your backend:
+// tehillim-backend/
+// ├── api/
+// │   ├── campaigns.js
+// │   ├── chapters.js
+// │   └── health.js
+// ├── package.json
+// ├── vercel.json
+// └── README.md
+
+// ==== package.json ====
+{
+  "name": "tehillim-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Tehillim Campaign Platform",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@vercel/kv": "^1.0.0"
+  },
+  "devDependencies": {
+    "vercel": "^32.0.0"
+  }
+}
+
+// ==== vercel.json ====
+{
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods", 
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization"
+        }
+      ]
+    }
+  ]
+}
+
+// ==== api/campaigns.js ====
+// Main campaigns API endpoint
+// GET /api/campaigns - Get all campaigns (limited to recent)
+// POST /api/campaigns - Create new campaign
+// GET /api/campaigns?id=X - Get specific campaign
+// PUT /api/campaigns?id=X - Update campaign
+// DELETE /api/campaigns?id=X - Delete campaign
+
+import { kv } from '@vercel/kv';
+
+export default async function handler(req, res) {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  try {
+    const { id } = req.query;
+
+    switch (req.method) {
+      case 'GET':
+        if (id) {
+          return await getCampaign(req, res, id);
+        } else {
+          return await getCampaigns(req, res);
+        }
+      case 'POST':
+        return await createCampaign(req, res);
+      case 'PUT':
+        if (id) {
+          return await updateCampaign(req, res, id);
+        }
+        res.status(400).json({ error: 'Campaign ID required for update' });
+        break;
+      case 'DELETE':
+        if (id) {
+          return await deleteCampaign(req, res, id);
+        }
+        res.status(400).json({ error: 'Campaign ID required for delete' });
+        break;
+      default:
+        res.status(405).json({ error: 'Method not allowed' });
+    }
+  } catch (error) {
+    console.error('API Error:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+}
+
+// Get all campaigns (recent ones for listing)
+async function getCampaigns(req, res) {
+  try {
+    // Get list of all campaign IDs
+    const campaignIds = await kv.smembers('tehillim:campaigns') || [];
+    
+    if (campaignIds.length === 0) {
+      return res.json([]);
+    }
+
+    // Get campaigns from last 7 days for listing
+    const campaigns = [];
+    const now = Date.now();
+    const WEEK = 7 * 24 * 60 * 60 * 1000;
+    
+    for (const id of campaignIds) {
+      try {
+        const campaign = await kv.hgetall(`tehillim:campaign:${id}`);
+        if (campaign && campaign.created) {
+          const createdTime = new Date(campaign.created).getTime();
+          if ((now - createdTime) <= WEEK) {
+            // Parse chapters JSON
+            if (campaign.chapters && typeof campaign.chapters === 'string') {
+              campaign.chapters = JSON.parse(campaign.chapters);
+            }
+            campaigns.push(campaign);
+          }
+        }
+      } catch (e) {
+        console.error(`Error loading campaign ${id}:`, e);
+        continue;
+      }
+    }
+
+    // Sort by creation date (newest first)
+    campaigns.sort((a, b) => new Date(b.created) - new Date(a.created));
+    
+    res.json(campaigns);
+  } catch (error) {
+    console.error('Error getting campaigns:', error);
+    res.status(500).json({ error: 'Failed to get campaigns' });
+  }
+}
+
+// Get specific campaign
+async function getCampaign(req, res, campaignId) {
+  try {
+    const campaign = await kv.hgetall(`tehillim:campaign:${campaignId}`);
+    
+    if (!campaign || Object.keys(campaign).length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    // Parse chapters JSON
+    if (campaign.chapters && typeof campaign.chapters === 'string') {
+      campaign.chapters = JSON.parse(campaign.chapters);
+    }
+
+    res.json(campaign);
+  } catch (error) {
+    console.error('Error getting campaign:', error);
+    res.status(500).json({ error: 'Failed to get campaign' });
+  }
+}
+
+// Create new campaign
+async function createCampaign(req, res) {
+  const { id, name, description, organizer, organizerEmail } = req.body;
+  
+  if (!id || !name || !organizer || !organizerEmail) {
+    return res.status(400).json({ error: 'Missing required fields: id, name, organizer, organizerEmail' });
+  }
+
+  try {
+    // Check if campaign already exists
+    const existing = await kv.hexists(`tehillim:campaign:${id}`, 'id');
+    if (existing) {
+      return res.status(409).json({ error: 'Campaign ID already exists' });
+    }
+
+    // Initialize chapters
+    const chapters = initializeChapters();
+    
+    const campaign = {
+      id,
+      name,
+      description: description || '',
+      organizer,
+      organizerEmail,
+      created: new Date().toISOString(),
+      chapters: JSON.stringify(chapters) // Store as JSON string
+    };
+
+    // Save campaign
+    await kv.hmset(`tehillim:campaign:${id}`, campaign);
+    
+    // Add to campaigns set
+    await kv.sadd('tehillim:campaigns', id);
+
+    // Return with parsed chapters for client
+    campaign.chapters = chapters;
+    
+    res.status(201).json(campaign);
+  } catch (error) {
+    console.error('Error creating campaign:', error);
+    res.status(500).json({ error: 'Failed to create campaign' });
+  }
+}
+
+// Update campaign (for chapter status changes)
+async function updateCampaign(req, res, campaignId) {
+  try {
+    const updates = req.body;
+    
+    // Check if campaign exists
+    const exists = await kv.hexists(`tehillim:campaign:${campaignId}`, 'id');
+    if (!exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    // If updating chapters, stringify them
+    if (updates.chapters) {
+      updates.chapters = JSON.stringify(updates.chapters);
+    }
+
+    // Update the campaign
+    await kv.hmset(`tehillim:campaign:${campaignId}`, updates);
+    
+    // Get updated campaign
+    const campaign = await kv.hgetall(`tehillim:campaign:${campaignId}`);
+    
+    // Parse chapters for response
+    if (campaign.chapters && typeof campaign.chapters === 'string') {
+      campaign.chapters = JSON.parse(campaign.chapters);
+    }
+
+    res.json(campaign);
+  } catch (error) {
+    console.error('Error updating campaign:', error);
+    res.status(500).json({ error: 'Failed to update campaign' });
+  }
+}
+
+// Delete campaign
+async function deleteCampaign(req, res, campaignId) {
+  try {
+    // Check if campaign exists
+    const exists = await kv.hexists(`tehillim:campaign:${campaignId}`, 'id');
+    if (!exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    // Delete campaign data
+    await kv.del(`tehillim:campaign:${campaignId}`);
+    
+    // Remove from campaigns set
+    await kv.srem('tehillim:campaigns', campaignId);
+
+    res.json({ success: true, message: 'Campaign deleted' });
+  } catch (error) {
+    console.error('Error deleting campaign:', error);
+    res.status(500).json({ error: 'Failed to delete campaign' });
+  }
+}
+
+// Initialize chapters structure (same as your frontend)
+function initializeChapters() {
+  const chapters = {};
+  for (let i = 1; i <= 150; i++) {
+    chapters[i] = {
+      status: 'available',
+      takenBy: null,
+      takenByEmail: null,
+      completedAt: null
+    };
+  }
+  return chapters;
+}
+
+// ==== api/chapters.js ====
+// Dedicated endpoint for chapter operations
+// PUT /api/chapters?campaign=X&chapter=Y - Take or complete a chapter
+// This allows for atomic chapter updates
+
+import { kv } from '@vercel/kv';
+
+export default async function handler(req, res) {
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  if (req.method !== 'PUT') {
+    return res.status(405).json({ error: 'Only PUT method allowed' });
+  }
+
+  try {
+    const { campaign: campaignId, chapter: chapterNum } = req.query;
+    const { action, name, email } = req.body;
+
+    if (!campaignId || !chapterNum) {
+      return res.status(400).json({ error: 'Campaign ID and chapter number required' });
+    }
+
+    // Get current campaign
+    const campaign = await kv.hgetall(`tehillim:campaign:${campaignId}`);
+    if (!campaign || !campaign.id) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    // Parse chapters
+    let chapters = {};
+    if (campaign.chapters) {
+      chapters = JSON.parse(campaign.chapters);
+    }
+
+    const chapter = chapters[chapterNum];
+    if (!chapter) {
+      return res.status(404).json({ error: 'Chapter not found' });
+    }
+
+    // Handle actions
+    if (action === 'take') {
+      if (chapter.status !== 'available') {
+        return res.status(409).json({ error: 'Chapter already taken' });
+      }
+
+      if (!name || !email) {
+        return res.status(400).json({ error: 'Name and email required to take chapter' });
+      }
+
+      chapter.status = 'taken';
+      chapter.takenBy = name;
+      chapter.takenByEmail = email;
+      chapter.takenAt = new Date().toISOString();
+
+    } else if (action === 'complete') {
+      if (chapter.status !== 'taken') {
+        return res.status(409).json({ error: 'Chapter must be taken before completion' });
+      }
+
+      chapter.status = 'completed';
+      chapter.completedAt = new Date().toISOString();
+
+    } else {
+      return res.status(400).json({ error: 'Invalid action. Use "take" or "complete"' });
+    }
+
+    // Save updated chapters
+    await kv.hset(`tehillim:campaign:${campaignId}`, 'chapters', JSON.stringify(chapters));
+
+    res.json({ 
+      success: true, 
+      chapter: chapterNum,
+      status: chapter.status,
+      data: chapter
+    });
+
+  } catch (error) {
+    console.error('Chapter update error:', error);
+    res.status(500).json({ error: 'Failed to update chapter' });
+  }
+}
+
+// ==== api/health.js ====
+// Health check endpoint
+export default function handler(req, res) {
+  res.json({
+    status: 'OK',
+    service: 'Tehillim Backend API',
+    timestamp: new Date().toISOString(),
+    endpoints: [
+      'GET /api/campaigns - List recent campaigns',
+      'GET /api/campaigns?id=X - Get specific campaign', 
+      'POST /api/campaigns - Create campaign',
+      'PUT /api/campaigns?id=X - Update campaign',
+      'DELETE /api/campaigns?id=X - Delete campaign',
+      'PUT /api/chapters?campaign=X&chapter=Y - Take/complete chapter'
+    ]
+  });
+}
+
+// ==== README.md ====
+/*
+# Tehillim Backend API
+
+Backend API for the Tehillim Campaign Platform using Vercel serverless functions and KV storage.
+
+## Features
+
+- Create and manage Tehillim reading campaigns
+- Track chapter assignments and completions
+- Real-time sync across multiple users
+- RESTful API with CORS support
+
+## Endpoints
+
+### Campaigns
+- `GET /api/campaigns` - Get recent campaigns (last 7 days)
+- `GET /api/campaigns?id=CAMPAIGN_ID` - Get specific campaign
+- `POST /api/campaigns` - Create new campaign
+- `PUT /api/campaigns?id=CAMPAIGN_ID` - Update campaign
+- `DELETE /api/campaigns?id=CAMPAIGN_ID` - Delete campaign
+
+### Chapters
+- `PUT /api/chapters?campaign=ID&chapter=NUM` - Take or complete a chapter
+
+### Utility
+- `GET /api/health` - Health check
+
+## Setup
+
+1. Create new repository from these files
+2. Deploy to Vercel (will auto-detect serverless functions)
+3. Add Vercel KV database in project settings
+4. Update frontend to use your API URL
+
+## Environment Variables
+
+Vercel KV is automatically configured when you add it to your project.
+
+## Frontend Integration
+
+Update your frontend's backend URL to point to your deployed Vercel app:
+```javascript
+const BACKEND_URL = 'https://your-tehillim-backend.vercel.app';
+```
+
+## Data Storage
+
+Uses Vercel KV (Redis) for:
+- Campaign data
+- Chapter status tracking
+- User assignments
+- Real-time synchronization
+
+## CORS
+
+Configured to allow all origins. Restrict in production if needed.
+*/
